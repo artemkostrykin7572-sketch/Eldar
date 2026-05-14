@@ -6,7 +6,7 @@ from fastapi.responses import JSONResponse
 
 from app.database import engine
 from app.models import DiaryEntry, RiskScore, UserProfile, WeatherRecord  # noqa: F401 — registers models with metadata
-from app.routers import diary_router, risk_router, users_router, weather_router
+from app.routers import diary_router, risk_router, stats_router, users_router, weather_router
 
 _ = (UserProfile, WeatherRecord, DiaryEntry, RiskScore)
 
@@ -36,6 +36,7 @@ app.include_router(users_router)
 app.include_router(weather_router)
 app.include_router(diary_router)
 app.include_router(risk_router)
+app.include_router(stats_router)
 
 
 @app.get("/health", tags=["system"])
