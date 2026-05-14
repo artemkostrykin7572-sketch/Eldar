@@ -317,6 +317,57 @@ class MlRiskPrediction {
   final String explanation;
 }
 
+// ─── API Stats Models ─────────────────────────────────────────────────────────
+
+class ApiInsightItem {
+  const ApiInsightItem({
+    required this.trigger,
+    required this.badDays,
+    required this.totalDays,
+    required this.percent,
+  });
+  final String trigger;
+  final int badDays, totalDays, percent;
+
+  factory ApiInsightItem.fromJson(Map<String, dynamic> j) => ApiInsightItem(
+    trigger:    j['trigger']    as String,
+    badDays:    j['bad_days']   as int,
+    totalDays:  j['total_days'] as int,
+    percent:    j['percent']    as int,
+  );
+}
+
+class UserStats {
+  const UserStats({
+    required this.totalEntries,
+    required this.hasEnoughData,
+    required this.insights,
+    required this.personalPrediction,
+  });
+  final int totalEntries;
+  final bool hasEnoughData;
+  final List<ApiInsightItem> insights;
+  final MlRiskPrediction personalPrediction;
+
+  factory UserStats.fromJson(Map<String, dynamic> j) {
+    final pred = j['personal_prediction'] as Map<String, dynamic>;
+    return UserStats(
+      totalEntries:  j['total_entries']    as int,
+      hasEnoughData: j['has_enough_data']  as bool,
+      insights: (j['insights'] as List)
+          .map((e) => ApiInsightItem.fromJson(e as Map<String, dynamic>))
+          .toList(),
+      personalPrediction: MlRiskPrediction(
+        predictedScore: 0,
+        adjustment:    pred['adjustment']  as int,
+        confidence:    (pred['confidence'] as num).toDouble(),
+        triggers:      (pred['triggers']   as List).cast<String>(),
+        explanation:   pred['explanation'] as String,
+      ),
+    );
+  }
+}
+
 // ─── Services ─────────────────────────────────────────────────────────────────
 
 class WeatherApiService {
@@ -557,6 +608,18 @@ class BackendApiService {
       );
     }).toList();
   }
+
+  // ── Stats ─────────────────────────────────────────────────────────────────
+
+  Future<UserStats> fetchStats(String userId) async {
+    final response = await http.get(
+      Uri.parse('$_kBackendBase/users/$userId/stats/'),
+    );
+    if (response.statusCode != 200) {
+      throw Exception('Не удалось загрузить статистику: HTTP ${response.statusCode}');
+    }
+    return UserStats.fromJson(jsonDecode(response.body) as Map<String, dynamic>);
+  }
 }
 
 // ─── Engines ──────────────────────────────────────────────────────────────────
@@ -751,6 +814,7 @@ class _ClimoShellState extends State<ClimoShell> {
 
   late List<WeatherRecord> _forecast = sampleForecast();
   late List<DiaryEntry>    _diary    = [];
+  UserStats? _stats;
   var _isLoadingWeather = false;
   String? _weatherError;
 
@@ -779,7 +843,7 @@ class _ClimoShellState extends State<ClimoShell> {
     try {
       _userId = await _backendApi.getOrCreateUser(_profile);
       if (!mounted) return;
-      await Future.wait([_loadRealWeather(), _loadDiaryFromBackend()]);
+      await Future.wait([_loadRealWeather(), _loadDiaryFromBackend(), _loadStats()]);
     } catch (e) {
       if (!mounted) return;
       setState(() {
@@ -817,6 +881,15 @@ class _ClimoShellState extends State<ClimoShell> {
     }
   }
 
+  Future<void> _loadStats() async {
+    if (_userId == null) return;
+    try {
+      final stats = await _backendApi.fetchStats(_userId!);
+      if (!mounted) return;
+      setState(() => _stats = stats);
+    } catch (_) {}
+  }
+
   @override
   Widget build(BuildContext context) {
     if (!_profile.disclaimerAccepted) {
@@ -840,6 +913,7 @@ class _ClimoShellState extends State<ClimoShell> {
       ForecastScreen(
         forecast: _forecast, profile: _profile, riskEngine: _riskEngine,
         diary: _diary, personalRiskModel: _personalRiskModel,
+        userStats: _stats,
       ),
       RecommendationsScreen(
         recommendations: currentRecs, allRecommendations: recommendations,
@@ -854,9 +928,12 @@ class _ClimoShellState extends State<ClimoShell> {
           _selectedSymptoms.contains(s) ? _selectedSymptoms.remove(s) : _selectedSymptoms.add(s);
         }),
         onSave: _saveDiaryEntry,
+        onQuickCheckin: _saveQuickEntry,
       ),
       ProfileScreen(
         profile: _profile,
+        diary: _diary,
+        userStats: _stats,
         onChanged: (p) {
           final cityChanged = p.city != _profile.city;
           setState(() => _profile = p);
@@ -870,6 +947,7 @@ class _ClimoShellState extends State<ClimoShell> {
     ];
 
     return _GradientBackground(
+      riskLevel: _todayRisk.level,
       child: Scaffold(
         backgroundColor: Colors.transparent,
         body: SafeArea(
@@ -922,6 +1000,25 @@ class _ClimoShellState extends State<ClimoShell> {
       const SnackBar(content: Text('Запись добавлена в дневник')),
     );
     // Сохраняем на бек в фоне; локальный список уже обновлён
+    if (_userId != null) {
+      _backendApi.saveDiaryEntry(_userId!, entry).catchError((_) {});
+    }
+  }
+
+  void _saveQuickEntry(int wellbeing) {
+    final risk  = _riskEngine.evaluate(_todayWeather, _profile);
+    final entry = DiaryEntry(
+      time:      DateTime.now(),
+      wellbeing: wellbeing,
+      symptoms:  const [],
+      comment:   '',
+      weather:   _todayWeather,
+      risk:      risk,
+    );
+    setState(() => _diary.insert(0, entry));
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('Самочувствие отмечено')),
+    );
     if (_userId != null) {
       _backendApi.saveDiaryEntry(_userId!, entry).catchError((_) {});
     }
@@ -1230,13 +1327,15 @@ class _ActionCard extends StatelessWidget {
 class ForecastScreen extends StatefulWidget {
   const ForecastScreen({
     required this.forecast, required this.profile, required this.riskEngine,
-    required this.diary, required this.personalRiskModel, super.key,
+    required this.diary, required this.personalRiskModel,
+    this.userStats, super.key,
   });
   final List<WeatherRecord> forecast;
   final UserProfile profile;
   final RiskEngine riskEngine;
   final List<DiaryEntry> diary;
   final PersonalRiskModel personalRiskModel;
+  final UserStats? userStats;
   @override
   State<ForecastScreen> createState() => _ForecastScreenState();
 }
@@ -1388,6 +1487,17 @@ class _ForecastScreenState extends State<ForecastScreen> {
                   ],
                 ),
               ),
+              if (widget.userStats != null || widget.diary.isNotEmpty) ...[
+                const SizedBox(height: 16),
+                _PersonalInsightCard(
+                  prediction: widget.userStats?.personalPrediction ??
+                      widget.personalRiskModel.predict(
+                        diary: widget.diary,
+                        weather: widget.forecast.first,
+                        baseRisk: risks.first,
+                      ),
+                ),
+              ],
             ],
           ),
         ),
@@ -1574,6 +1684,85 @@ class _ChartPainter extends CustomPainter {
       old.values != values || old.showDots != showDots || old.lineColor != lineColor;
 }
 
+// ─── Quick Check-in Card ──────────────────────────────────────────────────────
+
+class _QuickCheckinCard extends StatelessWidget {
+  const _QuickCheckinCard({required this.onCheckin});
+  final ValueChanged<int> onCheckin;
+
+  @override
+  Widget build(BuildContext context) {
+    return GlassCard(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text('Как вы?', style: Theme.of(context).textTheme.titleLarge),
+          const SizedBox(height: 4),
+          Text('Быстрая отметка одним нажатием',
+              style: Theme.of(context).textTheme.bodyMedium),
+          const SizedBox(height: 16),
+          Row(
+            children: [
+              Expanded(child: _CheckinButton(
+                label: 'Хорошо', emoji: '😊',
+                color: const Color(0xFF10B981), bg: const Color(0xFFD1FAE5),
+                onTap: () => onCheckin(8),
+              )),
+              const SizedBox(width: 10),
+              Expanded(child: _CheckinButton(
+                label: 'Средне', emoji: '😐',
+                color: const Color(0xFFD59300), bg: const Color(0xFFFEF3C7),
+                onTap: () => onCheckin(5),
+              )),
+              const SizedBox(width: 10),
+              Expanded(child: _CheckinButton(
+                label: 'Плохо', emoji: '😞',
+                color: const Color(0xFFF04452), bg: const Color(0xFFFFE4E6),
+                onTap: () => onCheckin(2),
+              )),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _CheckinButton extends StatelessWidget {
+  const _CheckinButton({
+    required this.label, required this.emoji,
+    required this.color, required this.bg, required this.onTap,
+  });
+  final String label, emoji;
+  final Color color, bg;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    return GestureDetector(
+      onTap: onTap,
+      child: Container(
+        padding: const EdgeInsets.symmetric(vertical: 16),
+        decoration: BoxDecoration(
+          color: bg,
+          borderRadius: BorderRadius.circular(18),
+          border: Border.all(color: color.withValues(alpha: 0.3), width: 1.5),
+        ),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Text(emoji, style: const TextStyle(fontSize: 26)),
+            const SizedBox(height: 4),
+            Text(label, style: TextStyle(
+              color: color, fontSize: 13, fontWeight: FontWeight.w700,
+            )),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
 // ─── Screen 4: Diary ──────────────────────────────────────────────────────────
 
 class DiaryScreen extends StatelessWidget {
@@ -1587,6 +1776,7 @@ class DiaryScreen extends StatelessWidget {
     required this.onSleepQualityChanged,
     required this.onSymptomToggle,
     required this.onSave,
+    required this.onQuickCheckin,
     super.key,
   });
 
@@ -1599,6 +1789,7 @@ class DiaryScreen extends StatelessWidget {
   final ValueChanged<double> onSleepQualityChanged;
   final ValueChanged<String> onSymptomToggle;
   final VoidCallback onSave;
+  final ValueChanged<int> onQuickCheckin;
 
   @override
   Widget build(BuildContext context) {
@@ -1609,6 +1800,8 @@ class DiaryScreen extends StatelessWidget {
           child: ListView(
             padding: const EdgeInsets.fromLTRB(22, 12, 22, 28),
             children: [
+              _QuickCheckinCard(onCheckin: onQuickCheckin),
+              const SizedBox(height: 14),
               // Wellbeing section
               GlassCard(
                 child: Column(
@@ -1697,6 +1890,112 @@ class DiaryScreen extends StatelessWidget {
   }
 }
 
+// ─── Personal Insight Card ────────────────────────────────────────────────────
+
+class _PersonalInsightCard extends StatelessWidget {
+  const _PersonalInsightCard({required this.prediction});
+  final MlRiskPrediction prediction;
+
+  @override
+  Widget build(BuildContext context) {
+    final hasAdj  = prediction.adjustment > 0;
+    final pct     = (prediction.confidence * 100).round();
+    return GlassCard(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(children: [
+            Container(
+              width: 44, height: 44,
+              decoration: BoxDecoration(
+                color: ClimoTheme.purpleLight,
+                borderRadius: BorderRadius.circular(14),
+              ),
+              child: const Icon(Icons.person_search_outlined, color: ClimoTheme.blue, size: 24),
+            ),
+            const SizedBox(width: 14),
+            Expanded(child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text('Персональный прогноз', style: Theme.of(context).textTheme.titleLarge),
+                Text('По данным вашего дневника', style: Theme.of(context).textTheme.bodyMedium),
+              ],
+            )),
+          ]),
+          const SizedBox(height: 16),
+          Row(children: [
+            _InsightStat(
+              label: 'Прогноз',
+              value: '${prediction.predictedScore}/10',
+              color: ClimoTheme.blue,
+            ),
+            if (hasAdj)
+              _InsightStat(
+                label: 'Поправка',
+                value: '+${prediction.adjustment}',
+                color: const Color(0xFFD59300),
+              ),
+            _InsightStat(
+              label: 'Уверенность',
+              value: '$pct%',
+              color: ClimoTheme.mint,
+            ),
+          ]),
+          const SizedBox(height: 14),
+          Container(
+            width: double.infinity,
+            padding: const EdgeInsets.all(14),
+            decoration: BoxDecoration(
+              color: ClimoTheme.purpleSoft,
+              borderRadius: BorderRadius.circular(14),
+            ),
+            child: Text(prediction.explanation,
+                style: Theme.of(context).textTheme.bodyLarge),
+          ),
+          if (prediction.triggers.isNotEmpty &&
+              prediction.triggers.first != 'явных персональных триггеров нет' &&
+              prediction.triggers.first != 'недостаточно записей') ...[
+            const SizedBox(height: 12),
+            Wrap(
+              spacing: 8, runSpacing: 8,
+              children: prediction.triggers.map((t) => Container(
+                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                decoration: BoxDecoration(
+                  color: const Color(0xFFFFE4E6),
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                child: Text(t, style: const TextStyle(
+                  fontSize: 13, color: Color(0xFFF04452), fontWeight: FontWeight.w600,
+                )),
+              )).toList(),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+}
+
+class _InsightStat extends StatelessWidget {
+  const _InsightStat({required this.label, required this.value, required this.color});
+  final String label, value;
+  final Color color;
+
+  @override
+  Widget build(BuildContext context) {
+    return Expanded(
+      child: Column(children: [
+        Text(value, style: TextStyle(
+          fontSize: 22, fontWeight: FontWeight.w700, color: color,
+        )),
+        const SizedBox(height: 2),
+        Text(label, style: Theme.of(context).textTheme.bodyMedium,
+            textAlign: TextAlign.center),
+      ]),
+    );
+  }
+}
+
 // ─── Screen: Recommendations ──────────────────────────────────────────────────
 
 class RecommendationsScreen extends StatelessWidget {
@@ -1755,8 +2054,16 @@ class RecommendationsScreen extends StatelessWidget {
 // ─── Screen: Profile ──────────────────────────────────────────────────────────
 
 class ProfileScreen extends StatelessWidget {
-  const ProfileScreen({required this.profile, required this.onChanged, super.key});
+  const ProfileScreen({
+    required this.profile,
+    required this.diary,
+    required this.onChanged,
+    this.userStats,
+    super.key,
+  });
   final UserProfile profile;
+  final List<DiaryEntry> diary;
+  final UserStats? userStats;
   final ValueChanged<UserProfile> onChanged;
 
   @override
@@ -1794,6 +2101,8 @@ class ProfileScreen extends StatelessWidget {
                 ),
               ),
               const SizedBox(height: 16),
+              _DiaryStatsCard(diary: diary, userStats: userStats),
+              const SizedBox(height: 16),
               const SoftWarningCard(),
             ],
           ),
@@ -1806,18 +2115,43 @@ class ProfileScreen extends StatelessWidget {
 // ─── Shared UI Widgets ────────────────────────────────────────────────────────
 
 class _GradientBackground extends StatelessWidget {
-  const _GradientBackground({required this.child});
+  const _GradientBackground({required this.child, this.riskLevel});
   final Widget child;
+  final RiskLevel? riskLevel;
+
+  Color get _topColor => switch (riskLevel) {
+    RiskLevel.high   => const Color(0xFFFFF5F5),
+    RiskLevel.medium => const Color(0xFFFFFBEB),
+    _                => ClimoTheme.gradientTop,
+  };
+
+  Color get _botColor => switch (riskLevel) {
+    RiskLevel.high   => const Color(0xFFFFE4E6),
+    RiskLevel.medium => const Color(0xFFFEF3C7),
+    _                => ClimoTheme.gradientBot,
+  };
+
   @override
   Widget build(BuildContext context) {
-    return Container(
-      decoration: const BoxDecoration(
-        gradient: LinearGradient(
-          begin: Alignment.topLeft, end: Alignment.bottomRight,
-          colors: [ClimoTheme.gradientTop, ClimoTheme.gradientBot],
+    return TweenAnimationBuilder<Color?>(
+      tween: ColorTween(end: _topColor),
+      duration: const Duration(milliseconds: 900),
+      curve: Curves.easeInOut,
+      builder: (_, top, __) => TweenAnimationBuilder<Color?>(
+        tween: ColorTween(end: _botColor),
+        duration: const Duration(milliseconds: 900),
+        curve: Curves.easeInOut,
+        builder: (_, bot, child) => Container(
+          decoration: BoxDecoration(
+            gradient: LinearGradient(
+              begin: Alignment.topLeft, end: Alignment.bottomRight,
+              colors: [top ?? _topColor, bot ?? _botColor],
+            ),
+          ),
+          child: child,
         ),
+        child: child,
       ),
-      child: child,
     );
   }
 }
@@ -2319,6 +2653,115 @@ class SoftWarningCard extends StatelessWidget {
         style: Theme.of(context).textTheme.bodyLarge,
       ),
     );
+  }
+}
+
+class _DiaryStatsCard extends StatelessWidget {
+  const _DiaryStatsCard({required this.diary, this.userStats});
+  final List<DiaryEntry> diary;
+  final UserStats? userStats;
+
+  static const _minDays = 3;
+
+  // Локальный расчёт — fallback когда API недоступен
+  List<String> _localInsights() {
+    if (diary.length < _minDays) return const [];
+    final data = <String, (int bad, int total)>{};
+    for (final e in diary) {
+      final isBad = e.wellbeing <= 4;
+      void count(String key) {
+        final prev = data[key] ?? (0, 0);
+        data[key] = (prev.$1 + (isBad ? 1 : 0), prev.$2 + 1);
+      }
+      if (e.weather.pressureDelta.abs() >= 6)    count('скачках давления');
+      if (e.weather.kpIndex >= 4)                count('магнитных бурях');
+      if (e.weather.temperatureDelta.abs() >= 7) count('перепадах температуры');
+    }
+    final result = <String>[];
+    for (final entry in data.entries) {
+      if (entry.value.$2 < 2) continue;
+      final pct = (entry.value.$1 / entry.value.$2 * 100).round();
+      if (pct >= 30) {
+        result.add(
+          'При ${entry.key} — в $pct% случаев '
+          '(${entry.value.$1} из ${entry.value.$2} дней) '
+          'самочувствие было плохим.',
+        );
+      }
+    }
+    return result;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    // API-данные в приоритете, иначе локальный расчёт
+    final apiStats = userStats;
+
+    final bool hasEnough = apiStats != null
+        ? apiStats.hasEnoughData
+        : diary.length >= _minDays;
+
+    final List<String> texts;
+    if (apiStats != null && apiStats.hasEnoughData) {
+      texts = apiStats.insights
+          .map((i) =>
+              'При ${i.trigger} — в ${i.percent}% случаев '
+              '(${i.badDays} из ${i.totalDays} дней) '
+              'самочувствие было плохим.')
+          .toList();
+    } else if (apiStats == null) {
+      texts = _localInsights();
+    } else {
+      texts = const [];
+    }
+
+    return GlassCard(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(children: [
+            Container(
+              width: 40, height: 40,
+              decoration: BoxDecoration(
+                color: ClimoTheme.purpleLight,
+                borderRadius: BorderRadius.circular(12),
+              ),
+              child: const Icon(Icons.bar_chart_rounded, color: ClimoTheme.blue, size: 22),
+            ),
+            const SizedBox(width: 12),
+            Expanded(child: Text('Ваша статистика',
+                style: Theme.of(context).textTheme.titleLarge)),
+          ]),
+          const SizedBox(height: 14),
+          if (!hasEnough)
+            Text(
+              'Добавьте ещё ${_minDays - diary.length} ${_plural(_minDays - diary.length)} дневника — появится персональная статистика.',
+              style: Theme.of(context).textTheme.bodyLarge,
+            )
+          else if (texts.isEmpty)
+            Text(
+              'Явных закономерностей между погодой и самочувствием не выявлено.',
+              style: Theme.of(context).textTheme.bodyLarge,
+            )
+          else
+            ...texts.map((s) => Padding(
+              padding: const EdgeInsets.only(bottom: 10),
+              child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                const Text('•  ', style: TextStyle(
+                  color: ClimoTheme.blue, fontWeight: FontWeight.w700, fontSize: 16,
+                )),
+                Expanded(child: Text(s, style: Theme.of(context).textTheme.bodyLarge)),
+              ]),
+            )),
+        ],
+      ),
+    );
+  }
+
+  static String _plural(int n) {
+    if (n == 1) return 'запись';
+    if (n <= 4) return 'записи';
+    return 'записей';
   }
 }
 
